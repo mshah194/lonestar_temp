@@ -1,0 +1,5 @@
+SUCCESS_URL: "https://lonestarbuckeyes.com/order-success.html"
+CANCEL_URL: "https://lonestarbuckeyes.com/order-canceled.html"
+ALLOWED_ORIGINS: "https://lonestarbuckeyes.com,https://www.lonestarbuckeyes.com"
+GMAIL_FROM: "info.lonestarbuckeye@gmail.com"
+SHOP_OWNER_EMAIL: "info.lonestarbuckeye@gmail.com"

@@ -1,12 +1,16 @@
 """
 Lonestar Buckeye Woodworks - Shop Checkout API
 
-A small, public (unauthenticated) Flask app with two jobs:
+A small, public (unauthenticated) Flask app with three jobs:
   1. Take a cart of product ids/quantities from the static site and turn it
      into a Stripe Checkout Session.
   2. For local-pickup-only items (furniture, swings, planters - too big to
      ship), check whether a customer's ZIP code is within the shop's
      50-mile pickup radius before they're allowed to buy online.
+  3. Receive an uploaded logo file for engraving customization and email it
+     to the shop owner (Stripe Checkout can't carry file attachments, and
+     Formspree's free plan doesn't support file uploads at all - see
+     api_upload_logo() below).
 
 Deliberately separate from LonestarAdminApp (which is password-gated for
 internal invoice use only) - this endpoint has to be reachable by any
@@ -24,8 +28,11 @@ import json
 import math
 import os
 import re
+import smtplib
+import ssl
 import urllib.error
 import urllib.request
+from email.message import EmailMessage
 
 import stripe
 from flask import Flask, jsonify, request
@@ -35,6 +42,17 @@ from catalog import PRODUCTS
 app = Flask(__name__)
 
 stripe.api_key = os.environ["STRIPE_SECRET_KEY"]
+
+# Reuses the exact same Gmail App Password/sending pattern already proven
+# out in LonestarAdminApp (see its invoice_core.py) - same GCP project,
+# same service account, so the GMAIL_APP_PASSWORD secret it already has
+# access to just needs to be attached to this service too (see README).
+GMAIL_FROM = os.environ.get("GMAIL_FROM", "info.lonestarbuckeye@gmail.com")
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
+SHOP_OWNER_EMAIL = os.environ.get("SHOP_OWNER_EMAIL", "info.lonestarbuckeye@gmail.com")
+MAX_LOGO_BYTES = 10 * 1024 * 1024  # 10MB - stays well under Gmail's 25MB
+                                    # total message cap once base64 overhead
+                                    # (~37%) on the attachment is factored in
 
 ALLOWED_ORIGINS = {
     o.strip()
@@ -160,6 +178,75 @@ def api_check_pickup_zip():
         "distance_miles": distance,
         "radius_miles": PICKUP_RADIUS_MILES,
     })
+
+
+def send_logo_email(product_name, qty, reference, text_note, uploaded_file):
+    """Emails an uploaded logo file to the shop owner via Gmail SMTP -
+    mirrors send_invoice_email() in LonestarAdminApp/invoice_core.py, the
+    already-proven pattern this project uses for outbound mail."""
+    msg = EmailMessage()
+    msg["From"] = GMAIL_FROM
+    msg["To"] = SHOP_OWNER_EMAIL
+    msg["Subject"] = f"New engraving logo — {product_name} (Ref {reference})"
+    body_lines = [f"Product: {product_name}", f"Quantity: {qty}", f"Reference: {reference}"]
+    if text_note:
+        body_lines.append(f"Text note: {text_note}")
+    msg.set_content("\n".join(body_lines))
+
+    content_type = uploaded_file.mimetype or "application/octet-stream"
+    maintype, _, subtype = content_type.partition("/")
+    msg.add_attachment(
+        uploaded_file.read(),
+        maintype=maintype or "application",
+        subtype=subtype or "octet-stream",
+        filename=uploaded_file.filename or "logo",
+    )
+
+    context = ssl.create_default_context()
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
+        server.login(GMAIL_FROM, GMAIL_APP_PASSWORD)
+        server.send_message(msg)
+
+
+@app.route("/api/upload-logo", methods=["OPTIONS"])
+def preflight_upload_logo():
+    return "", 204
+
+
+@app.route("/api/upload-logo", methods=["POST"])
+def api_upload_logo():
+    """Receives an engraving logo file at add-to-cart time and emails it to
+    the owner. Replaces the original Formspree-based approach, which turned
+    out to reject file attachments entirely on Formspree's free plan
+    (discovered via a real customer-reported failure post-launch, 2026-08-25) -
+    see LonestarShopApp/README.md for the full story."""
+    if not GMAIL_APP_PASSWORD:
+        return jsonify({"error": "Logo upload isn't configured yet - please email it to us directly."}), 503
+
+    uploaded_file = request.files.get("logo")
+    if not uploaded_file or not uploaded_file.filename:
+        return jsonify({"error": "No file was uploaded."}), 400
+
+    uploaded_file.seek(0, os.SEEK_END)
+    size = uploaded_file.tell()
+    uploaded_file.seek(0)
+    if size == 0:
+        return jsonify({"error": "The uploaded file is empty."}), 400
+    if size > MAX_LOGO_BYTES:
+        limit_mb = MAX_LOGO_BYTES // (1024 * 1024)
+        return jsonify({"error": f"File is too large - please keep it under {limit_mb}MB."}), 400
+
+    product_name = (request.form.get("product") or "Custom engraved item").strip()[:120]
+    qty = (request.form.get("quantity") or "1").strip()[:10]
+    reference = (request.form.get("reference") or "").strip()[:20] or "N/A"
+    text_note = (request.form.get("text_note") or "").strip()[:200]
+
+    try:
+        send_logo_email(product_name, qty, reference, text_note, uploaded_file)
+    except Exception:
+        return jsonify({"error": "We couldn't email your logo - please try again or contact us directly."}), 502
+
+    return jsonify({"ok": True, "reference": reference})
 
 
 @app.route("/api/create-checkout-session", methods=["OPTIONS"])
@@ -299,8 +386,13 @@ def create_checkout_session():
     return jsonify({"url": session.url})
 
 
-@app.route("/healthz")
+@app.route("/api/health")
 def healthz():
+    # NOT "/healthz" - that exact path is reserved at Google's Cloud Run
+    # frontend layer and gets intercepted before ever reaching the
+    # container (returns a generic Google 404, no request log entry, no
+    # trace of it in this app at all). Confirmed via Google's own developer
+    # forums - a known platform quirk, not specific to this app.
     return jsonify({"ok": True})
 
 
@@ -321,6 +413,13 @@ if __name__ == "__main__":
 #   SHOP_LAT              = 33.2019   (McKinney, TX area - see comment in code)
 #   SHOP_LNG              = -96.6753
 #   PICKUP_RADIUS_MILES   = 50     (straight-line distance, not driving distance)
+#   GMAIL_FROM            = info.lonestarbuckeye@gmail.com
+#   SHOP_OWNER_EMAIL      = info.lonestarbuckeye@gmail.com  (where logo uploads get emailed)
+#
+# GMAIL_APP_PASSWORD (a secret, not a plain env var - same one already used
+# by LonestarAdminApp) is required for the /api/upload-logo endpoint to
+# work, but its absence doesn't crash the app - checkout keeps working
+# either way, that one endpoint just returns a clear error until it's set.
 #
 # Shipping is weight-based (see WEIGHT_SHIPPING_TIERS above) rather than an
 # env var - edit that list directly in code to change the rates/breakpoints.

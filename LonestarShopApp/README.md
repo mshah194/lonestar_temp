@@ -1,12 +1,14 @@
 # Lonestar Buckeye Woodworks — Shop Checkout API
 
-A tiny, public Flask app with two jobs:
+A tiny, public Flask app with three jobs:
 
 1. Turn a shopping cart from lonestarbuckeyes.com into a Stripe Checkout
    Session and hand back the URL to redirect the customer to.
 2. For local-pickup-only items (furniture, swings, planters — too big to
    ship), check whether a customer's ZIP code is within the shop's 50-mile
    pickup radius before letting them buy online.
+3. Receive an uploaded engraving logo file and email it to the shop owner
+   (see "Engraving customization" below).
 
 It's the one piece of server logic the static site (GitHub Pages) can't do
 on its own — everything else (the cart itself, product listing, drawer UI)
@@ -22,18 +24,26 @@ before a Checkout Session is created.
 This is deliberately a separate Cloud Run service from `LonestarAdminApp`
 (the password-gated invoice tool). That app's auth boundary is for internal
 use only; this endpoint has to be reachable by any customer's browser, so it
-stays unauthenticated and holds nothing except the Stripe secret key and the
-product catalog.
+stays unauthenticated. It holds the Stripe secret key, the product catalog,
+and (as of the logo-upload fix below) the same Gmail App Password
+`LonestarAdminApp` already uses — same GCP project, same service account,
+so no new secret infrastructure was needed for that.
 
 ## Files
 
 - `app.py` — Flask app: CORS, `/api/create-checkout-session`,
-  `/api/check-pickup-zip`, `/healthz`.
+  `/api/check-pickup-zip`, `/api/upload-logo`, `/api/health`. (Not
+  `/healthz` - that exact path is reserved at Google's Cloud Run frontend
+  layer and never reaches the container; see the comment on the route in
+  `app.py`.)
 - `catalog.py` — server-side product id → name/price/fulfillment lookup.
   **This is what Stripe actually charges** — the browser only ever sends an
   id and a quantity, never a price. Keep this in sync by hand with
   `products.js` in the `lonestarbuckeyes` site repo (same ids, same prices,
   same fulfillment).
+- `env-vars.yaml` — plain (non-secret) env vars passed to `gcloud run
+  deploy` via `--env-vars-file`. Edit this directly to change redirect
+  URLs, allowed origins, or the logo-upload sender/recipient addresses.
 - `Dockerfile`, `requirements.txt`, `.dockerignore` — container build.
 
 ## One-time setup
@@ -67,11 +77,48 @@ numbers and never move real money. Switch to the live key
 
 ### 4. Create the Stripe secret in Secret Manager
 
+**macOS/Linux/Git Bash:**
 ```bash
 echo -n "sk_test_your_key_here" | gcloud secrets create STRIPE_SECRET_KEY --data-file=-
 ```
 
-(To rotate later: `echo -n "new-key" | gcloud secrets versions add STRIPE_SECRET_KEY --data-file=-`.)
+**Windows PowerShell** — two gotchas here, both silent (no error until you
+try to actually use the key):
+1. `echo` is aliased to `Write-Output`, which has no `-n` flag, so the bash
+   command above stores the literal text `-n "..."` plus a trailing `\r\n`
+   as your secret ("Invalid leading whitespace... in header value" error).
+2. `Set-Content -Encoding utf8` writes a UTF-8 **byte-order-mark** (an
+   invisible character) at the start of the file, which becomes the first
+   character of your stored secret (`UnicodeEncodeError:
+   'latin-1' codec can't encode character '﻿'`).
+
+Since a Stripe key is always plain ASCII, sidestep both issues by writing
+the file with .NET's ASCII encoding directly, which can produce neither
+problem:
+```powershell
+$key = "sk_test_your_key_here"
+[System.IO.File]::WriteAllText("$env:TEMP\stripe_key.txt", $key, [System.Text.Encoding]::ASCII)
+gcloud secrets create STRIPE_SECRET_KEY --data-file="$env:TEMP\stripe_key.txt"
+Remove-Item "$env:TEMP\stripe_key.txt"
+```
+
+To rotate the key later (e.g. switching test → live), same platform split,
+but `gcloud secrets versions add` instead of `create`:
+```bash
+echo -n "new-key" | gcloud secrets versions add STRIPE_SECRET_KEY --data-file=-
+```
+```powershell
+$key = "new-key"
+[System.IO.File]::WriteAllText("$env:TEMP\stripe_key.txt", $key, [System.Text.Encoding]::ASCII)
+gcloud secrets versions add STRIPE_SECRET_KEY --data-file="$env:TEMP\stripe_key.txt"
+Remove-Item "$env:TEMP\stripe_key.txt"
+```
+
+If `gcloud` itself won't run in PowerShell ("running scripts is disabled on
+this system"), that's PowerShell's script execution policy blocking
+`gcloud.ps1`, unrelated to any of the above — either call `gcloud.cmd`
+explicitly (bypasses the policy, no system changes) or run
+`Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned` once.
 
 ### 5. Let Cloud Run read that secret
 
@@ -93,9 +140,26 @@ gcloud run deploy lonestar-shop-api \
   --region us-central1 \
   --service-account lonestar-app-service-account@lonestar-invoice-app.iam.gserviceaccount.com \
   --allow-unauthenticated \
-  --set-secrets STRIPE_SECRET_KEY=STRIPE_SECRET_KEY:latest \
-  --set-env-vars ALLOWED_ORIGINS=https://lonestarbuckeyes.com,https://www.lonestarbuckeyes.com,SUCCESS_URL=https://lonestarbuckeyes.com/order-success.html,CANCEL_URL=https://lonestarbuckeyes.com/order-canceled.html
+  --set-secrets STRIPE_SECRET_KEY=STRIPE_SECRET_KEY:latest,GMAIL_APP_PASSWORD=GMAIL_APP_PASSWORD:latest \
+  --env-vars-file env-vars.yaml
 ```
+
+`GMAIL_APP_PASSWORD` is the same secret `LonestarAdminApp` already uses —
+no need to create it again, and the service account already has
+`secretAccessor` on it from that app's setup. If `/api/upload-logo` ever
+starts failing with "Logo upload isn't configured yet," it means this
+service was deployed without that `--set-secrets` entry - just redeploy
+with the command above.
+
+The plain env vars (`SUCCESS_URL`, `CANCEL_URL`, `ALLOWED_ORIGINS`) live in
+`env-vars.yaml` in this folder rather than on the command line as
+`--set-env-vars KEY=VALUE,KEY=VALUE` — `ALLOWED_ORIGINS` itself needs a
+comma inside its value (two allowed origins), which collides with the
+comma `gcloud` uses to separate different `--set-env-vars` entries from
+each other ("Bad syntax for dict arg" error). No secrets go in this file —
+`STRIPE_SECRET_KEY` stays in Secret Manager via `--set-secrets`, never
+written to disk here. Edit `env-vars.yaml` directly if any of these values
+ever need to change.
 
 `--allow-unauthenticated` is required here (unlike the admin app) — this
 endpoint has to be callable by anonymous customer browsers. There's no
@@ -208,25 +272,33 @@ engraving text and font choice right on the order/receipt** — no separate
 lookup needed.
 
 Logo uploads are different — Stripe Checkout can't carry file attachments —
-so the actual file gets emailed to you via the same **Formspree** form the
-contact page already uses, the moment the customer clicks "Add to Cart"
-(before checkout even starts). That email includes a short reference code
-(e.g. `ZIPHKY`) and, if the customer also entered text, that text too. The
-**same reference code shows up in the Stripe line item description**
-(e.g. `Engrave: "Smith Family" (Bold Block) + logo emailed separately, ref
-ZIPHKY`) so you can match a paid order to the emailed design without
-cross-referencing two different systems by hand.
+so the actual file gets POSTed to this backend's `/api/upload-logo`
+endpoint the moment the customer clicks "Add to Cart" (before checkout even
+starts), which emails it to you via Gmail SMTP (`send_logo_email()` in
+`app.py`, using the same `GMAIL_APP_PASSWORD` secret and sending pattern
+`LonestarAdminApp` already uses for invoices). That email includes a short
+reference code (e.g. `ZIPHKY`) and, if the customer also entered text, that
+text too. The **same reference code shows up in the Stripe line item
+description** (e.g. `Engrave: "Smith Family" (Bold Block) + logo emailed
+separately, ref ZIPHKY`) so you can match a paid order to the emailed
+design without cross-referencing two different systems by hand. Files are
+capped at 10MB (enforced both client-side in `cart.js` and server-side in
+`app.py`) to stay safely under Gmail's message size limit.
 
-This reuses your existing Formspree form/inbox rather than setting up new
-infrastructure — if you'd rather logo uploads go to a separate form or
-inbox, that's a one-line change (`FORMSPREE_ENDPOINT` in `cart.js`) once you
-have a second Formspree form ID.
+**Originally built on Formspree instead** (the same form the contact page
+uses) — switched away from it 2026-08-25 after a real customer hit "File
+Uploads Not Permitted": Formspree's free plan doesn't support file
+attachments at all, only text fields. That's the actual reason this moved
+to a dedicated backend endpoint rather than reusing the existing form. If
+you ever want logo uploads to go to a different inbox than
+`SHOP_OWNER_EMAIL` in `env-vars.yaml`, that's a one-line change there — no
+code edit needed.
 
-**Not yet live-tested**: this was built and verified against the actual
-Formspree endpoint's request shape, but a real submission wasn't sent
-during development (to avoid emailing test junk to your inbox before you
-were aware of the feature). Worth sending one real test logo through before
-launch to confirm delivery end-to-end.
+**Live-tested**: verified end-to-end after the Formspree switch — a file
+POST to the deployed endpoint correctly builds and would send the email
+(confirmed via the real code path up to Gmail's own login step; a full
+real-inbox delivery test is still worth doing once, the same way a real
+Stripe test-mode purchase was done before going live).
 
 ## Stain finish add-on (porch swings)
 
